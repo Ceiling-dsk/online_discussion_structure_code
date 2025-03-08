@@ -7,8 +7,9 @@ import datetime
 import re
 import mysql.connector
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
+from threading import Thread
+from queue import Queue
+import sys
 
 # ============ 日志配置 ============
 
@@ -36,49 +37,52 @@ DB_CONFIG = {
     'password': 'QAZwsx520'
 }
 
-# ============ 引用解析函数 ============
-
-QUOTE_BLOCK_PATTERN = re.compile(
-    r'\[quote=(.*?)\](.*?)\[/quote\]',
-    flags=re.IGNORECASE | re.DOTALL
-)
-
-def extract_quotes_and_clean(content: str):
-    """
-    用来解析帖子中的引用块，并去除它们在正文中的显示。
-
-    返回 (refs, cleaned_text):
-    - refs -> list，表示引用结构的层级信息（被引用作者、内容、嵌套引用）
-    - cleaned_text -> 删掉 [quote=...]...[/quote] 后的文本（即纯正文）
-    """
-    def _extract_recursive(text):
-        matches = list(QUOTE_BLOCK_PATTERN.finditer(text))
-        if not matches:
-            return [], text
-        
-        references = []
-        for m in matches:
-            author = m.group(1).strip()
-            inner_text = m.group(2)
-            nested_refs, inner_clean = _extract_recursive(inner_text)
-            references.append({
-                "quoted_author": author,
-                "quoted_content": inner_clean.strip(),
-                "quote": nested_refs
-            })
-        cleaned = QUOTE_BLOCK_PATTERN.sub('', text)
-        return references, cleaned
-
-    refs, out_text = _extract_recursive(content)
-    out_text = re.sub(r'\n\s*\n', '\n', out_text).strip()
-    return refs, out_text
 
 # ============ 线性获取所有话题 ============
 
-def fetch_topics(session, headers):
+def insert_topics_batch(conn, topics):
     """
-    同步地爬取所有能获取到的主题，直到接口返回空数据为止。
+    插入一批topics到数据库
     """
+    insert_sql = """
+        INSERT INTO topics(topic_id, topic_title, category_id, category_name)
+        VALUES (%s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          topic_title = VALUES(topic_title),
+          category_id = VALUES(category_id),
+          category_name = VALUES(category_name)
+    """
+    cur = conn.cursor()
+    for t in topics:
+        cur.execute(insert_sql, (
+            t['topic_id'], t['topic_title'],
+            t.get('category_id'), t.get('category_name')
+        ))
+    conn.commit()
+    cur.close()
+
+def fetch_topics_producer(session, headers, topic_queue):
+    """
+    边抓topics边写数据库，并将新的topics放进队列供后续爬帖子。
+    同时读取progress表，跳过已经完成（爬过）的topic_id，实现断点续抓。
+    """
+    # 建立连接
+    conn = mysql.connector.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    
+    # 1) 读取progress表，获取已经处理完的topic_id
+    done_ids = set()
+    try:
+        cur.execute("SELECT topic_id FROM progress")
+        rows = cur.fetchall()
+        for r in rows:
+            done_ids.add(r[0])
+        logging.info(f"progress表中已有 {len(done_ids)} 个已完成的topic。")
+    except Exception as e:
+        logging.error(f"读取 progress 表失败: {e}")
+        
+        
+    # 准备抓 topic
     url = 'https://artofproblemsolving.com/m/community/ajax.php'
     data = {
         'category_type': 'forum',
@@ -96,107 +100,90 @@ def fetch_topics(session, headers):
     }
     retries = 0
     max_retries = 5
-
-    all_topics = []
-    counter = 0  # 计数器，累计抓取多少条topic
+    total_count = 0
 
     while retries < max_retries:
-        logging.debug(f"正在请求，fetch_before={data['fetch_before']}")
-
         try:
             response = session.post(url, headers=headers, data=data, timeout=20)
-        except requests.exceptions.RequestException as e:
-            if "ConnectionResetError" in str(e):
-                logging.error(f"[topic_id] Connection reset by peer, sleep 10s then retry: {e}")
-                time.sleep(10)  # 特别等待更久
-                retries += 1
-            elif "Read timed out" in str(e):
-                logging.error(f"[fetch_topics] Read timed out, sleep 10s then retry: {e}")
-                time.sleep(10)
-                retries += 1
-            logging.error(f"请求异常: {e}")
-            # 若还没到达 max_retries，则继续 while循环重试
-            if retries >= max_retries:
-                logging.error(f"[fetch_topics] 超过最大重试次数，放弃。")
-                break
-            else:
-                continue
-
-        if response.status_code != 200:
-            logging.error(f"请求失败，状态码: {response.status_code}")
-            break
-
-        try:
             response_data = response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"fetch_topics 请求异常: {e}")
+            retries += 1
+            time.sleep(5)
+            continue
         except ValueError:
-            logging.error("响应不是有效的 JSON 格式，停止爬取。")
-            logging.debug(f"原始响应内容: {response.text}")
+            logging.error("响应不是 JSON 格式")
             break
 
-        if 'response' not in response_data:
-            logging.error("响应中缺少 'response' 键。")
-            logging.debug("完整响应内容: %s", json.dumps(response_data, ensure_ascii=False, indent=4))
-            break
-
-        response_content = response_data.get('response', {})
-        topics = response_content.get('topics', [])
-        logging.info(f"本次响应包含 {len(topics)} 个主题。")
-
+        content = response_data.get('response', {})
+        topics = content.get('topics', [])
         if not topics:
-            logging.info("没有更多数据可供爬取，停止。")
+            logging.info("没有更多 topic 数据，停止。")
             break
-
-        # 累计添加
-        for t in topics:
-            tid = t.get('topic_id')
-            ttitle = t.get('topic_title')
-            
-            # 如果接口里有 category_id, category_name，就可以这样拿：
-            cid = t.get('category_id')  
-            cname = t.get('category_name')
-
-            # 如果接口里没有，就只能手动写，如：
-            # cid = data['category_id']  # 如果你是强制给它设置的
-            # cname = "Middle School Math"  # 根据你的需求
-
-            if tid and ttitle:
-                all_topics.append({
-                    'topic_id': tid,
-                    'topic_title': ttitle,
-                    'category_id': cid,
-                    'category_name': cname
-                })
         
-        # 更新计数器
-        counter += len(topics)
-        # 在控制台输出当前抓取进度
-        print(f"已经抓到 {counter} 条 Topic。")
+        # 2) 先插数据库
+        insert_topics_batch(conn, topics)
+        total_count += len(topics)
+        logging.info(f"本次抓到 {len(topics)} 个topic，累计{total_count}")
 
-        # 更新 fetch_before
+        # 3) 跳过progress里已有的，剩下的放队列
+        new_count = 0
+        for t in topics:
+            tid = t['topic_id']
+            if tid not in done_ids:
+                topic_queue.put(t)
+                new_count += 1
+        logging.info(f"其中 {new_count} 个topic是新需要抓帖子的。")
+
+        # 4) 翻页
         last_topic = topics[-1]
         if 'last_post_time' in last_topic:
-            try:
-                min_timestamp = int(last_topic['last_post_time']) - 1
-                data['fetch_before'] = str(min_timestamp)
-            except ValueError:
-                logging.error("last_post_time 不是有效的整数，停止爬取。")
-                break
+            data['fetch_before'] = str(int(last_topic['last_post_time']) - 1)
         else:
-            logging.warning("无法找到 last_post_time，停止爬取。")
             break
 
         time.sleep(random.uniform(1, 2))
 
-    # 去重
-    unique_topics = {t['topic_id']: t for t in all_topics}
-    all_topics = list(unique_topics.values())
-    logging.info(f"总共收集到 {len(all_topics)} 个主题。")
-    time.sleep(random.uniform(1, 2))  # 放慢抓取 topic 的速度
-    return all_topics
+    logging.info(f"Topic 抓取结束, 共获取 {total_count} 个topic(包含已完成的)。")
+    cur.close()
+    conn.close()   # 通知消费者没有更多新topic
+
+
+# ============ Consumer：抓帖子逻辑(不变，大体) ============
+def fetch_posts_worker(topic_queue, session, headers):
+    """
+    消费者：不断从 topic_queue 里拿出一个 topic，抓该 topic 的posts
+    并边写 posts表 (每个worker自己开/关MySQL连接)。
+    """
+    while True:
+        topic = topic_queue.get()
+        if topic is None:
+            # 表示没有更多topic
+            topic_queue.task_done()
+            break
+
+        try:
+            # 每个worker独立连数据库
+            conn = mysql.connector.connect(**DB_CONFIG)
+            cur = conn.cursor()
+
+            # === 在这抓帖子 ===
+            fetch_posts_for_topic(topic, session, headers, conn)
+
+            cur.close()
+            conn.close()
+        except Exception as e:
+            logging.error(f"fetch_posts_worker 异常: {e}")
+        finally:
+            topic_queue.task_done()
+
+    
+    
+ 
 
 # ============ 多线程抓取帖子 ============
 
-def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
+def fetch_posts_for_topic(topic, session, headers, conn):
     """
     同步抓取指定 topic 下的所有帖子，并插入到数据库。
     返回本次抓取的帖子数量（可用于做统计）。
@@ -259,9 +246,7 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
                 continue
             fetched_post_ids.add(post_id)
 
-            # 提取引用和清理正文
-            raw_content = post.get('post_canonical', '')
-            references, clean_content = extract_quotes_and_clean(raw_content)
+
             post_time_unix = post.get('post_time', 0)
             post_time_dt = datetime.datetime.utcfromtimestamp(post_time_unix)
 
@@ -302,29 +287,28 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
             # MySQL upsert 写法
             insert_sql = """
                 INSERT INTO posts(
-                    post_id, topic_id, author, content, post_time, post_references,
+                    post_id, topic_id, author, post_canonical, post_time, 
                     admin, attachment, avatar, deletable, deleted, editable,
                     is_forum_admin, is_nothanked, is_thanked, last_edit_reason,
                     last_edit_time, last_editor_username, nothanks_received,
-                    num_edits, num_posts, post_canonical, post_format, post_number,
+                    num_edits, num_posts,  post_format, post_number,
                     post_rendered, poster_id, reported, show_from_end, show_from_start,
                     thankers, thanks_received
                 )
                 VALUES (
-                    %(post_id)s, %(topic_id)s, %(author)s, %(content)s, %(post_time)s, %(post_references)s,
+                    %(post_id)s, %(topic_id)s, %(author)s, %(post_canonical)s, %(post_time)s, 
                     %(admin)s, %(attachment)s, %(avatar)s, %(deletable)s, %(deleted)s, %(editable)s,
                     %(is_forum_admin)s, %(is_nothanked)s, %(is_thanked)s, %(last_edit_reason)s,
                     %(last_edit_time)s, %(last_editor_username)s, %(nothanks_received)s,
-                    %(num_edits)s, %(num_posts)s, %(post_canonical)s, %(post_format)s, %(post_number)s,
+                    %(num_edits)s, %(num_posts)s,  %(post_format)s, %(post_number)s,
                     %(post_rendered)s, %(poster_id)s, %(reported)s, %(show_from_end)s, %(show_from_start)s,
                     %(thankers)s, %(thanks_received)s
                 )
                 ON DUPLICATE KEY UPDATE
                     topic_id = VALUES(topic_id),
                     author = VALUES(author),
-                    content = VALUES(content),
+                    post_canonical = VALUES(post_canonical),
                     post_time = VALUES(post_time),
-                    post_references = VALUES(post_references),
                     admin = VALUES(admin),
                     attachment = VALUES(attachment),
                     avatar = VALUES(avatar),
@@ -340,7 +324,7 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
                     nothanks_received = VALUES(nothanks_received),
                     num_edits = VALUES(num_edits),
                     num_posts = VALUES(num_posts),
-                    post_canonical = VALUES(post_canonical),
+                    
                     post_format = VALUES(post_format),
                     post_number = VALUES(post_number),
                     post_rendered = VALUES(post_rendered),
@@ -355,10 +339,8 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
                 'post_id': int(post_id),
                 'topic_id': int(topic_id),
                 'author': post.get('username'),
-                'content': clean_content,
+                'post_canonical': post_canonical, 
                 'post_time': post_time_dt,
-                'post_references': json.dumps(references, ensure_ascii=False),
-
                 'admin': admin,
                 'attachment': attachment,
                 'avatar': avatar,
@@ -374,7 +356,6 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
                 'nothanks_received': nothanks_received,
                 'num_edits': num_edits,
                 'num_posts': num_posts,
-                'post_canonical': post_canonical,
                 'post_format': post_format,
                 'post_number': post_number,
                 'post_rendered': post_rendered,
@@ -398,6 +379,8 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
                 logging.error(f"[topic_id={topic_id}] 插入帖子 {post_id} 失败: {e}")
 
         conn.commit()
+        
+        logging.info(f"[topic_id={topic_id}] 开始抓posts...")
 
         data['start_post_num'] = str(int(data['start_post_num']) + len(posts))
 
@@ -422,29 +405,24 @@ def fetch_posts_for_topic(session, headers, topic, conn, cur_progress):
 
     # 原逻辑是 "ON CONFLICT DO NOTHING", 用 MySQL 可用 INSERT IGNORE or ON DUP KEY
     try:
-        cur_progress.execute(
-            "INSERT IGNORE INTO progress(topic_id) VALUES (%s)",
-            (topic_id,)
-        )
-        conn.commit()
+      with conn.cursor() as c:
+        c.execute("INSERT IGNORE INTO progress(topic_id) VALUES(%s)", (topic_id,))
+      conn.commit()
     except Exception as e:
-        logging.error(f"[topic_id={topic_id}] 插入进度表失败: {e}")
+      logging.error(f"[topic_id={topic_id}] 插入进度表失败: {e}")
 
     cur.close()
     return total_inserted
+  
 
 # ============ 主函数 ============
 
 def main():
     start_time = time.time()
-
-    # 建立 MySQL 连接
-    try:
-        conn = mysql.connector.connect(**DB_CONFIG)
-        logging.info("MySQL 数据库连接成功。")
-    except mysql.connector.Error as e:
-        logging.error(f"数据库连接失败: {e}")
-        return
+    
+    # 先建session
+    session = requests.Session()
+    session.trust_env = False
 
     headers = {
         'Accept': 'application/json, text/javascript, */*; q=0.01',
@@ -468,93 +446,42 @@ def main():
                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'),
         'X-Requested-With': 'XMLHttpRequest',
     }
+    # 准备一个队列用于topics
+    topic_queue = Queue()
+    # 启动Producer   
+    # 1) 启动一个线程去抓topic + 写topic表 + 往队列放topic
+    producer_thread = Thread(target=fetch_topics_producer, args=(session, headers, topic_queue))
+    producer_thread.start()
+    # 启动多个Consumer
+    # 2) 启动多个worker线程，从队列拿topic，抓posts并写库
+    worker_count = 5
+    worker_threads = []
+    for _ in range(worker_count):
+        t = Thread(target=fetch_posts_worker, args=(topic_queue, session, headers))
+        t.start()
+        worker_threads.append(t)
 
-    session = requests.Session()
-    session.trust_env = False
+    # 3) 等producer结束
+    producer_thread.join()
 
-    # -- 1. 读取已完成的 topic_id
-    done_topic_ids = set()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("SELECT topic_id FROM progress;")
-            rows = cur.fetchall()
-            for r in rows:
-                done_topic_ids.add(str(r[0]))
-    except Exception as e:
-        logging.error(f"读取 progress 表失败: {e}")
-        pass
+    # 这里确定producer结束后，你也可以再放够数量的None
+    for _ in range(worker_count):
+        topic_queue.put(None)
 
-    # -- 2. 抓取所有 topic
-    all_topics = fetch_topics(session, headers)
-    logging.info(f"抓到 {len(all_topics)} 个主题。")
+    # 4) 等worker把队列里的topic处理完
+    # topic_queue.join()  # 如果你要确保全部处理完再往下
 
-    # -- 3. 插/更新 topics
-    try:
-        with conn.cursor() as cur:
-            insert_topics_sql = """
-                INSERT INTO topics(topic_id, topic_title, category_id, category_name)
-                VALUES (%s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                  topic_title = VALUES(topic_title),
-                  category_id = VALUES(category_id),
-                  category_name = VALUES(category_name)
-            """
-            for t in all_topics:
-                cur.execute(
-                    insert_topics_sql,
-                    (
-                        int(t['topic_id']),
-                        t['topic_title'],
-                        t.get('category_id'),
-                        t.get('category_name')
-                    )
-                )
-        conn.commit()
-    except Exception as e:
-        logging.error(f"插入 topics 表时出错: {e}")
-        session.close()
-        conn.close()
-        return
-
-    # -- 4. 过滤已爬取的
-    topics_to_crawl = [t for t in all_topics if t['topic_id'] not in done_topic_ids]
-    logging.info(f"有 {len(topics_to_crawl)} 个主题需要新抓取。")
-
-    # -- 5. 多线程抓取帖子
-    max_threads = 5
-    total_posts_inserted = 0  
-
-    with ThreadPoolExecutor(max_workers=max_threads) as executor:
-        cur_progress = conn.cursor()
-        futures = []
-        for topic in topics_to_crawl:
-            future = executor.submit(
-                fetch_posts_for_topic, session, headers, topic, conn, cur_progress
-            )
-            futures.append(future)
-
-        for future in tqdm(as_completed(futures), total=len(futures), desc="抓取帖子"):
-            try:
-                inserted_count = future.result()
-                total_posts_inserted += inserted_count
-            except Exception as exc:
-                logging.error(f"抓取线程出现异常: {exc}")
-
-        conn.commit()
-        cur_progress.close()
-
-    session.close()
-    conn.close()
+    for t in worker_threads:
+        t.join()
 
     end_time = time.time()
-    elapsed_time = end_time - start_time
-    hours, rem = divmod(elapsed_time, 3600)
-    minutes, seconds = divmod(rem, 60)
-    formatted_time = f"{int(hours)}小时 {int(minutes)}分钟 {int(seconds)}秒"
+    elapsed = end_time - start_time
+    h, rem = divmod(elapsed, 3600)
+    m, s = divmod(rem, 60)
+    logging.info(f"总耗时 {int(h)}小时{int(m)}分钟{int(s)}秒.")
+    print("Done.")
 
-    print(f"爬取完成：共获取 {len(all_topics)} 个主题，新增抓取 {len(topics_to_crawl)} 个，插入帖子 {total_posts_inserted} 条。")
-    print(f"程序运行时间: {formatted_time}")
-    logging.info(f"爬虫结束，插入帖子总数={total_posts_inserted}；程序耗时: {formatted_time}")
+    
 
 if __name__ == "__main__":
     main()
